@@ -18,3 +18,5 @@ rl_logs/
 pokeenv/scripts/replays/*
 pokeenv/scripts/results/*
 
+showdown_agent/scripts/replays/*
+showdown_agent/scripts/results/*
