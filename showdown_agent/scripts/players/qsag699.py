@@ -1,6 +1,11 @@
 from poke_env.battle import AbstractBattle, Pokemon, Move, MoveCategory, Weather, Effect, Status
 from poke_env.player import Player
 from poke_env.data import GenData
+from logging import Logger
+import os
+import csv
+
+logger = Logger(__name__)
 
 team = """
 Arceus-Electric @ Zap Plate
@@ -80,7 +85,7 @@ GUARANTEED_CRITICAL_MOVES = {"Storm Throw","Frost Breath","Zippy Zap","Surging S
 def fetch_attack_multiplier(attack_type: str, attacking_types: list[str], attacking_ability: str, defending_types: list[str]) -> float:
     m = 1.0
     for defending_type in defending_types:
-        m *= TYPE_CHART.get(attack_type, {}).get(defending_type, 1.0)
+        m *= TYPE_CHART.get(attack_type).get(defending_type)
     
     if attack_type in attacking_types:
         if attacking_ability == "Adaptability":
@@ -103,12 +108,16 @@ def fetch_pokemon_types(pokemon: Pokemon) -> list[str]:
 def fetch_move_type(move: Move) -> str:
     if move.type and move.type.name:
         return move.type.name
+    
+    logger.warning(f"Move {move} has no type, defaulting to 'Normal'")
     return "Normal"
 
 # Fetch the move's name as a string
 def fetch_move_name(move: Move) -> str:
-    if move.name:
-        return move.name
+    if move.id:
+        return move.id
+    
+    logger.warning(f"Move {move} has no id, defaulting to 'Unknown Move'")
     return "Unknown Move"
 
 ##################
@@ -118,20 +127,24 @@ def fetch_move_name(move: Move) -> str:
 # Calculate the anticipated damage for a given move in the battle conditions
 # Follows Bulbapedia equation for Gen V + (https://bulbapedia.bulbagarden.net/wiki/Damage)
 def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, weather: Weather):
+    # Calculate level factor impacting base damage
     def calculate_level_ratio(attacker: Pokemon) -> float:
         return ((2*attacker.level)/5) + 2
     
+    # Calculate attack/defense ratio impacting base damage
     def calculate_attack_defense_ratio(attacker: Pokemon, defender: Pokemon, move: Move) -> float:
         if move.category == MoveCategory.PHYSICAL:
-            return attacker.stats["atk"] / defender.stats["def"]
+            return attacker.stats["atk"] / (defender.stats["def"] or defender.base_stats["def"])
         elif move.category == MoveCategory.SPECIAL:
-            return attacker.stats["spa"] / defender.stats["spd"]
+            return attacker.stats["spa"] / (defender.stats["spd"] or defender.base_stats["spd"])
         return 1.0
     
+    # Calculate base damage
     def calculate_base(attacker: Pokemon, defender: Pokemon, move: Move) -> float:
         return (calculate_level_ratio(attacker) * move.base_power * 
                 calculate_attack_defense_ratio(attacker, defender, move) / 50) + 2
 
+    # Calculate current weather effect on damage
     def calculate_weather_bonus(move: Move, weather: Weather) -> float:
         move_name = fetch_move_name(move)
         move_type = fetch_move_type(move)
@@ -154,24 +167,38 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
             return 1.0
         return 1.0
     
+    # Calculate Glaive Rush effect on damage
     def calculate_glaive_bonus(defender: Pokemon) -> float:
+        if not defender.effects:
+            return 1.0
+        
         if Effect.GLAIVE_RUSH in defender.effects:
             return 2.0
         else:
             return 1.0
-        
+    
+    # Calculate whether any move is guaranteed to (or never to) critically hit
     def calculate_determined_critical_hit(attacker: Pokemon, defender: Pokemon, move: Move) -> float:
+        if not defender.ability:
+            return 1.0
+
         if defender.ability == "Battle Armor" or defender.ability == "Shell Armor":
             return 1.0
-        # TODO: Cant seem to find lucky chant effect
         if fetch_move_name(move) in GUARANTEED_CRITICAL_MOVES:
             return 1.5
+        
+        
+        if not defender.status:
+            return 1.0
+        
         if defender.status == Status.PSN and attacker.ability == "Merciless":
             return 1.5
+        
         if Effect.LASER_FOCUS in attacker.effects:
             return 1.5
         return 1.0
-        
+    
+    # Calculate burn status on damage
     def calculate_burn_factor(attacker: Pokemon, move: Move) -> float:
         if move.category != MoveCategory.PHYSICAL:
             return 1.0
@@ -183,6 +210,7 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
             return 1.0
         return 0.5
 
+    # Calculate type effectiveness on damage excluding STAB
     def calculate_type_effectiveness(attacker: Pokemon, defender: Pokemon, move: Move, weather: Weather) -> float:
         multi = 1.0
         move_type = fetch_move_type(move)
@@ -190,37 +218,36 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
 
         for defending_type in fetch_pokemon_types(defender):
             if move_name == "Flying Press":
-                multi *= TYPE_CHART.get("Fighting", {}).get(defending_type, 1.0) * TYPE_CHART.get("Flying", {}).get(defending_type, 1.0)
+                multi *= TYPE_CHART.get("Fighting").get(defending_type) * TYPE_CHART.get("Flying").get(defending_type)
                 continue
             if move_name == "Freeze-Dry" and defending_type == "Water":
                 multi *= 2.0
                 continue
 
-            effectiveness = TYPE_CHART.get(move_type, {}).get(defending_type, 1.0)
-
+            effectiveness = TYPE_CHART.get(move_type).get(defending_type)
+            
             if attacker.ability == "Scrappy" and defending_type == "Ghost" and move_type in {"Normal", "Fighting"} and effectiveness == 0.0:
                 effectiveness = 1.0
             if move_name == "Thousand Arrows" and defending_type == "Flying":
                 effectiveness = 1.0
-            if defender.item == "Ring Target" and effectiveness == 0.0:
+            if defender.item and defender.item == "Ring Target" and effectiveness == 0.0:
                 effectiveness = 1.0
             
-            if (Effect.FORESIGHT in defender.effects) and defending_type == "Ghost" and move_type in {"Normal", "Fighting"} and effectiveness == 0.0:
+            if defender.effects and (Effect.FORESIGHT in defender.effects) and defending_type == "Ghost" and move_type in {"Normal", "Fighting"} and effectiveness == 0.0:
                 effectiveness = 1.0
-            if Effect.MIRACLE_EYE in defender.effects and defending_type == "Dark" and move_type == "Psychic" and effectiveness == 0.0:
+            if defender.effects and Effect.MIRACLE_EYE in defender.effects and defending_type == "Dark" and move_type == "Psychic" and effectiveness == 0.0:
                 effectiveness = 1.0
 
             multi *= effectiveness
 
         return multi
 
+    # Calculate stab multiplier on damage
     def calculate_stab(attacker: Pokemon, move: Move) -> float:
         move_type = fetch_move_type(move)
         if move_type == "Typeless":
             return 1.0
-
         adapt = attacker.ability == "Adaptability"
-        
         orig_match = move_type in fetch_pokemon_types(attacker)
         tera_match = attacker.is_terastallized and attacker.tera_type == move_type
         tera_same_as_orig = attacker.is_terastallized and attacker.tera_type in fetch_pokemon_types(attacker)
@@ -229,14 +256,16 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
         if tera_match and tera_same_as_orig:
             return 2.25 if adapt else 2.0
         if tera_match and not tera_same_as_orig:
-            return 2.0 if adapt else 1.5
+            return 2.0
         if orig_match:
             return 1.5
         return 1.0
 
+    # Early exit for 0 damage moves
     if move.category not in (MoveCategory.PHYSICAL, MoveCategory.SPECIAL) or move.base_power == 0:
         return 0.0
 
+    # Calculate approximate damage
     base = calculate_base(attacker, defender, move)
 
     modifiers = []
@@ -248,6 +277,7 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
     modifiers.append(calculate_type_effectiveness(attacker, defender, move, weather))
     modifiers.append(calculate_burn_factor(attacker, move))
 
+
     total_modifier = 1.0
     for modifier in modifiers:
         total_modifier *= modifier
@@ -258,9 +288,31 @@ class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(team=team, *args, **kwargs)
 
+    # Log results as CSV for review
+    def _battle_finished_callback(self, battle: AbstractBattle):
+        result = "Win" if battle.won else "Loss"
+        my_remaining = sum(p.current_hp > 0 for p in battle.team.values())
+        opp_remaining = sum(p.current_hp > 0 for p in battle.opponent_team.values())
+        log_path = "battle_results.csv"
+        file_exists = os.path.isfile(log_path)
+        with open(log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["battle_tag", "result", "my_remaining", "opp_remaining"])
+            writer.writerow([battle.battle_tag, result, my_remaining, opp_remaining])
+
     def choose_move(self, battle: AbstractBattle):
-        if battle.available_moves:
-            best_move = max(battle.available_moves, key=lambda move: calculate_expected_damage(battle.active_pokemon, battle.opponent_active_pokemon, move, battle.weather))
-            return self.create_order(best_move)
-        else:
+        if not battle.available_moves:
             return self.choose_random_move(battle)
+        else:
+            best_move = max(
+                battle.available_moves,
+                key=lambda m: calculate_expected_damage(
+                    battle.active_pokemon,
+                    battle.opponent_active_pokemon,
+                    m,
+                    battle.weather,
+                ),
+            )
+            return self.create_order(best_move)
+            

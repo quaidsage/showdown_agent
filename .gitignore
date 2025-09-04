@@ -19,4 +19,5 @@ pokeenv/scripts/replays/*
 pokeenv/scripts/results/*
 
 showdown_agent/scripts/replays/*
-showdown_agent/scripts/results/*
+showdown_agent/scripts/battle_results.csv
+showdown_agent/scripts/results/marking_results.txt
