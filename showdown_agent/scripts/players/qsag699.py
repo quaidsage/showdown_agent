@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 from poke_env.battle import AbstractBattle, Pokemon, Move, MoveCategory, Weather, Effect, Status
 from poke_env.player import Player
 from poke_env.data import GenData
 from logging import Logger
+from enum import Enum, auto
 import os
 import csv
 
@@ -69,6 +71,23 @@ Jolly Nature
 - Substitute
 """
 
+###########
+#  Types  #
+###########
+
+class ActionType(Enum):
+    ATTACK = auto()
+    STATUS = auto()
+    HEAL = auto()
+    SWITCH = auto()
+
+@dataclass
+class Action:
+    type: ActionType
+    move: Move | None = None
+    target: Pokemon | None = None
+    score: float = 0.0
+
 ###############
 #  Constants  #
 ###############
@@ -77,23 +96,27 @@ TYPE_CHART = GenData.from_gen(9).type_chart
 
 GUARANTEED_CRITICAL_MOVES = {"Storm Throw","Frost Breath","Zippy Zap","Surging Strikes","Wicked Blow","Flower Trick"}
 
+HEALING_MOVES = {"Recover","Roost","Slack Off","Soft-Boiled","Milk Drink","Synthesis","Morning Sun","Moonlight","Shore Up"}
+
+SWITCH_MOVES = {"U-turn","Volt Switch","Parting Shot","Flip Turn"}
+
+FIRST_ACTING_WEIGHTS = {
+    "switch": 1.0,
+    "attack": 0.9,
+    "heal": 0.7,
+    "status": 1.0,
+}
+
+LAST_ACTING_WEIGHTS = {
+    "switch": 1.0,
+    "attack": 0.7,
+    "heal": 0.9,
+    "status": 1.0,
+}
+
 #############
 #  Utility  #
 #############
-
-# Calculate damage multiplier of an attack relative to the defending pokemon's type
-def fetch_attack_multiplier(attack_type: str, attacking_types: list[str], attacking_ability: str, defending_types: list[str]) -> float:
-    m = 1.0
-    for defending_type in defending_types:
-        m *= TYPE_CHART.get(attack_type).get(defending_type)
-    
-    if attack_type in attacking_types:
-        if attacking_ability == "Adaptability":
-            m *= 2.0
-        else:
-            m *= 1.5
-            
-    return m
 
 # Fetch the pokemon's types and format into list
 def fetch_pokemon_types(pokemon: Pokemon) -> list[str]:
@@ -120,13 +143,58 @@ def fetch_move_name(move: Move) -> str:
     logger.warning(f"Move {move} has no id, defaulting to 'Unknown Move'")
     return "Unknown Move"
 
-##################
-#  Calculations  #
-##################
+# Fetch healing moves from a pokemon
+def fetch_healing_moves(pokemon: Pokemon) -> list[Move]:
+    healing_moves = []
+    for move in pokemon.moves.values():
+        if move.category == MoveCategory.STATUS and fetch_move_name(move) in HEALING_MOVES:
+            healing_moves.append(move)
+    return healing_moves
+
+# Fetch switching moves from a pokemon
+def fetch_switch_moves(pokemon: Pokemon) -> list[Move]:
+    switch_moves = []
+    for move in pokemon.moves.values():
+        if move.id in SWITCH_MOVES:
+            switch_moves.append(move)
+    return switch_moves
+
+# Fetch status moves from a pokemon excluding healing moves
+def fetch_status_moves(pokemon: Pokemon) -> list[Move]:
+    status_moves = []
+    for move in pokemon.moves.values():
+        if move.category == MoveCategory.STATUS:
+            status_moves.append(move)
+
+    # remove healing status moves to simplify logic
+    healing_moves = fetch_healing_moves(pokemon)
+    for move in healing_moves:
+        if move in status_moves:
+            status_moves.remove(move)
+
+    return status_moves
+
+# Fetch if acting first
+def fetch_acting_first(attacker: Pokemon, defender: Pokemon) -> bool:
+    if not (attacker and attacker.moves) or not (defender and defender.moves):
+        return True
+    attacker_priority = max((m.priority for m in attacker.moves.values()), default=0)
+    defender_priority = max((m.priority for m in defender.moves.values()), default=0)
+    if attacker_priority != defender_priority:
+        return attacker_priority > defender_priority
+    return (attacker.stats["spe"] or attacker.base_stats["spe"]) >= (defender.stats["spe"] or defender.base_stats["spe"])
+
+
+#######################
+#  Base Calculations  #
+#######################
 
 # Calculate the anticipated damage for a given move in the battle conditions
-# Follows Bulbapedia equation for Gen V + (https://bulbapedia.bulbagarden.net/wiki/Damage)
+# Roughly follows Bulbapedia equation for Gen V + (https://bulbapedia.bulbagarden.net/wiki/Damage) in relation to Gen 9 Ubers
 def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, weather: Weather):
+    if not attacker or not defender or not move:
+        return 0.0
+    
     # Calculate level factor impacting base damage
     def calculate_level_ratio(attacker: Pokemon) -> float:
         return ((2*attacker.level)/5) + 2
@@ -134,9 +202,9 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
     # Calculate attack/defense ratio impacting base damage
     def calculate_attack_defense_ratio(attacker: Pokemon, defender: Pokemon, move: Move) -> float:
         if move.category == MoveCategory.PHYSICAL:
-            return attacker.stats["atk"] / (defender.stats["def"] or defender.base_stats["def"])
+            return (attacker.stats["atk"] or attacker.base_stats["atk"]) / (defender.stats["def"] or defender.base_stats["def"])
         elif move.category == MoveCategory.SPECIAL:
-            return attacker.stats["spa"] / (defender.stats["spd"] or defender.base_stats["spd"])
+            return (attacker.stats["spa"] or attacker.base_stats["spa"]) / (defender.stats["spd"] or defender.base_stats["spd"])
         return 1.0
     
     # Calculate base damage
@@ -262,7 +330,7 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
         return 1.0
 
     # Early exit for 0 damage moves
-    if move.category not in (MoveCategory.PHYSICAL, MoveCategory.SPECIAL) or move.base_power == 0:
+    if not move or move.category not in (MoveCategory.PHYSICAL, MoveCategory.SPECIAL) or move.base_power == 0:
         return 0.0
 
     # Calculate approximate damage
@@ -283,6 +351,160 @@ def calculate_expected_damage(attacker: Pokemon, defender: Pokemon, move: Move, 
         total_modifier *= modifier
 
     return base * total_modifier
+
+# Calculate the expected healing of a given status move. Very over-simplified.
+def calculate_expected_healing(healer, move):
+    name = fetch_move_name(move)
+    if name == "Rest":
+        return healer.max_hp - healer.current_hp
+    return min(healer.max_hp - healer.current_hp, healer.max_hp * 0.5)
+
+# Calculates the pokemons expected next move
+def calculate_anticipated_move(attacker: Pokemon, defender: Pokemon, weather: Weather) -> Move:
+    if not attacker.moves:
+        return None
+
+    best_move = max(
+        attacker.moves.values(),
+        key=lambda m: calculate_expected_damage(
+            attacker,
+            defender,
+            m,
+            weather,
+        ),
+    )
+    return best_move
+
+# Calculates the pokemons expected next status move
+def calculate_anticipated_status_move(attacker: Pokemon, defender: Pokemon, weather: Weather) -> Move:
+    status_moves = fetch_status_moves(attacker)
+    if not status_moves:
+        return None
+    
+    best_move = max(
+        status_moves,
+        key=lambda m: calculate_expected_damage(
+            attacker,
+            defender,
+            m,
+            weather,
+        ),
+    )
+    return best_move
+
+# Calculates the pokemons expected next healing move
+def calculate_anticipated_healing_move(healer: Pokemon) -> Move:
+    healing_moves = fetch_healing_moves(healer)
+    if not healing_moves:
+        return None
+    
+    best_move = max(
+        healing_moves,
+        key=lambda m: calculate_expected_healing(
+            healer,
+            m,
+        ),
+    )
+    return best_move
+
+# Calculates the approximate best pokemon to switch into
+def calculate_best_switch(battle: AbstractBattle) -> Pokemon:
+    if not battle.available_switches:
+        return None
+    best_switch = min(
+        battle.available_switches,
+        key=lambda p: calculate_threat_value(battle.opponent_active_pokemon, p, battle.weather),
+    )
+    return best_switch
+
+########################
+#  Value Calculations  #
+########################
+
+# Calculate the threat value of the attacker based on their best move
+def calculate_threat_value(attacker: Pokemon, defender: Pokemon, weather: Weather) -> float:
+    if not attacker or not defender:
+        return 0.0
+    
+    best_move = calculate_anticipated_move(attacker, defender, weather)
+    expected_damage = calculate_expected_damage(attacker, defender, best_move, weather)
+    return expected_damage / defender.max_hp
+
+# Calculates the value of switching out the current pokemon
+def calculate_switch_value(battle: AbstractBattle) -> float:
+    current_threat = calculate_threat_value(
+        battle.opponent_active_pokemon,
+        battle.active_pokemon,
+        battle.weather,
+    )
+    best_switch = calculate_best_switch(battle)
+    best_switch_threat = calculate_threat_value(
+        battle.opponent_active_pokemon,
+        best_switch,
+        battle.weather,
+    )
+    return max(0.0, current_threat - best_switch_threat)
+
+# Calculate the value of attacking a pokemon with the best move
+def calculate_attack_value(attacker: Pokemon, defender: Pokemon, weather: Weather) -> float:
+    if not attacker or not defender:
+        return 0.0
+    
+    best_move = calculate_anticipated_move(attacker, defender, weather)
+    expected_damage = calculate_expected_damage(attacker, defender, best_move, weather)
+    attack_value = expected_damage / defender.max_hp
+    return attack_value
+
+# Calculate the value of using status move
+def calculate_status_value(attacker: Pokemon, defender: Pokemon, weather: Weather) -> float:
+    if not attacker or not defender:
+        return 0.0
+
+    anticipated_status_move = calculate_anticipated_status_move(attacker, defender, weather)
+    return attacker.current_hp / defender.current_hp if anticipated_status_move else 0.0
+
+# Calculates the value of using the pokemons best healing move
+def calculate_heal_value(healer: Pokemon):
+    if not healer:
+        return 0.0
+    
+    best_move = calculate_anticipated_healing_move(healer)
+    if not best_move:
+        return 0.0
+    expected_healing = calculate_expected_healing(healer, best_move)
+    return expected_healing / healer.max_hp
+
+# Calculate most effective move
+def calculate_most_effective_move(battle: AbstractBattle, player: Pokemon, opponent: Pokemon, weather: Weather) -> Move:
+    if not player or not opponent:
+        return None
+    
+    switch_value = calculate_switch_value(battle) # If high, should consider switching
+    status_value = calculate_status_value(player, opponent, weather) # If low, could use status move
+    attack_value = calculate_attack_value(player, opponent, weather) # If high, should attack
+    heal_value = calculate_heal_value(player) # If high, should heal
+
+    weights = FIRST_ACTING_WEIGHTS if fetch_acting_first(player, opponent) else LAST_ACTING_WEIGHTS
+
+    actions: list[Action] = [
+        Action(type=ActionType.SWITCH, score=switch_value * weights["switch"]),
+        Action(type=ActionType.ATTACK, score=attack_value * weights["attack"]),
+        Action(type=ActionType.STATUS, score=status_value * weights["status"]),
+        Action(type=ActionType.HEAL, score=heal_value * weights["heal"]),
+    ]
+
+    best_action = max(actions, key=lambda a: a.score)
+
+    if best_action.type == ActionType.SWITCH:
+        return calculate_best_switch(battle)
+    elif best_action.type == ActionType.ATTACK:
+        return calculate_anticipated_move(player, opponent, weather)
+    elif best_action.type == ActionType.STATUS:
+        return calculate_anticipated_status_move(player, opponent, weather)
+    elif best_action.type == ActionType.HEAL:
+        return calculate_anticipated_healing_move(player)
+    else:
+        return None
 
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
@@ -305,14 +527,14 @@ class CustomAgent(Player):
         if not battle.available_moves:
             return self.choose_random_move(battle)
         else:
-            best_move = max(
-                battle.available_moves,
-                key=lambda m: calculate_expected_damage(
-                    battle.active_pokemon,
-                    battle.opponent_active_pokemon,
-                    m,
-                    battle.weather,
-                ),
+            best_move = calculate_most_effective_move(
+                battle,
+                battle.active_pokemon,
+                battle.opponent_active_pokemon,
+                battle.weather,
             )
-            return self.create_order(best_move)
+            if best_move:
+                return self.create_order(best_move)
+            else:
+                return self.choose_random_move(battle)
             
